@@ -1,0 +1,119 @@
+name: Build and Publish MinIO Images to GHCR
+
+on:
+  push:
+    branches:
+      - master
+      - 'feature/**'
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/docker-publish.yml'
+    tags:
+      - 'RELEASE.*'
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: 'Select version to build'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - 'both'
+          - 'RELEASE.2025-04-22T22-12-26Z'
+          - 'RELEASE.2025-10-15T17-29-55Z'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  define-matrix:
+    name: Setup Build Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.set-matrix.outputs.targets }}
+    steps:
+      - id: set-matrix
+        run: |
+          CHOICE="${{ github.event.inputs.target_version || 'both' }}"
+          if [ "${CHOICE}" = "RELEASE.2025-04-22T22-12-26Z" ]; then
+            echo 'targets=[{"release":"RELEASE.2025-04-22T22-12-26Z","ref":"RELEASE.2025-04-22T22-12-26Z","commit":"0d7408fc9969caf07de6a8c3a84f9fbb10a6739e","latest":false}]' >> $GITHUB_OUTPUT
+          elif [ "${CHOICE}" = "RELEASE.2025-10-15T17-29-55Z" ]; then
+            echo 'targets=[{"release":"RELEASE.2025-10-15T17-29-55Z","ref":"RELEASE.2025-10-15T17-29-55Z","commit":"9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a","latest":true}]' >> $GITHUB_OUTPUT
+          else
+            echo 'targets=[{"release":"RELEASE.2025-04-22T22-12-26Z","ref":"RELEASE.2025-04-22T22-12-26Z","commit":"0d7408fc9969caf07de6a8c3a84f9fbb10a6739e","latest":false},{"release":"RELEASE.2025-10-15T17-29-55Z","ref":"RELEASE.2025-10-15T17-29-55Z","commit":"9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a","latest":true}]' >> $GITHUB_OUTPUT
+          fi
+
+  build-and-publish:
+    name: Build & Push (${{ matrix.target.release }})
+    needs: define-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.define-matrix.outputs.targets) }}
+
+    steps:
+      - name: Checkout current repository for Dockerfile
+        uses: actions/checkout@v4
+        with:
+          path: current-repo
+
+      - name: Preserve Docker assets
+        run: |
+          mkdir -p /tmp/docker-assets
+          cp current-repo/Dockerfile /tmp/docker-assets/Dockerfile
+          if [ -d current-repo/dockerscripts ]; then
+            mkdir -p /tmp/docker-assets/dockerscripts
+            cp -r current-repo/dockerscripts/* /tmp/docker-assets/dockerscripts/
+          fi
+
+      - name: Checkout source code at target tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.target.ref }}
+          path: src-repo
+
+      - name: Inject Docker build assets into target source
+        run: |
+          cp /tmp/docker-assets/Dockerfile src-repo/Dockerfile
+          if [ -d /tmp/docker-assets/dockerscripts ]; then
+            mkdir -p src-repo/dockerscripts
+            cp -r /tmp/docker-assets/dockerscripts/* src-repo/dockerscripts/
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: meta
+        run: |
+          IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/minio"
+          IMAGE_NAME=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+          TAGS="${IMAGE_NAME}:${{ matrix.target.release }}"
+          if [ "${{ matrix.target.latest }}" = "true" ]; then
+            TAGS="${TAGS},${IMAGE_NAME}:latest"
+          fi
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+
+      - name: Build and Push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: src-repo
+          file: src-repo/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            RELEASE=${{ matrix.target.release }}
+            COMMIT_ID=${{ matrix.target.commit }}
